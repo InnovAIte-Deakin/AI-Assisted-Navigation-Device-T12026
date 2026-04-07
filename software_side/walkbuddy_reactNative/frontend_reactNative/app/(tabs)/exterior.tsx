@@ -1,22 +1,10 @@
-/*
-   NOTE:
-   The speech recognition feature (expo-speech-recognition) has been temporarily
-   commented out due to build/runtime issues encountered when running the
-   application on Android (Expo Go environment).
-
-   This feature requires native module support, which is not fully compatible
-   with the current setup, leading to errors during execution.
-
-   This will be fixed and added back in future updates.
-*/
-
 // Exterior Navigation Screen with Production Features
 import { MaterialIcons } from "@expo/vector-icons";
 import * as Location from "expo-location";
 import * as Haptics from "expo-haptics";
 import * as Speech from "expo-speech";
-import { useFocusEffect } from "expo-router";
-// import { ExpoSpeechRecognitionModule, useSpeechRecognitionEvent } from "expo-speech-recognition";
+import { useFocusEffect, useLocalSearchParams } from "expo-router";
+import { ExpoSpeechRecognitionModule, useSpeechRecognitionEvent } from "expo-speech-recognition";
 import React, {
   useCallback,
   useEffect,
@@ -94,11 +82,11 @@ export default function ExteriorNavigationScreen() {
   const [showSuggestions, setShowSuggestions] = useState(false);
   const [fromAutocompleteSuggestions, setFromAutocompleteSuggestions] = useState<AutocompleteSuggestion[]>([]);
   const [showFromSuggestions, setShowFromSuggestions] = useState(false);
-  const autocompleteTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const fromAutocompleteTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const autocompleteTimeoutRef = useRef<NodeJS.Timeout | null>(null);
+  const fromAutocompleteTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const recognitionRef = useRef<any>(null);
   const nativeRecognitionResultRef = useRef<string>("");
-  const routeSearchTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const routeSearchTimeoutRef = useRef<NodeJS.Timeout | null>(null);
   const routeCacheRef = useRef<Map<string, Route>>(new Map());
   const [route, setRoute] = useState<Route | null>(null);
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
@@ -106,6 +94,11 @@ export default function ExteriorNavigationScreen() {
   const [isLoadingRoute, setIsLoadingRoute] = useState(false);
   const [eta, setEta] = useState<number | null>(null);
   const [startTime, setStartTime] = useState<number | null>(null);
+
+  const { presetDestination, presetType } = useLocalSearchParams<{
+    presetDestination?: string;
+    presetType?: string;
+  }>();
 
   const locationSubscriptionRef = useRef<Location.LocationSubscription | null>(
     null
@@ -120,6 +113,7 @@ export default function ExteriorNavigationScreen() {
   const deviationCheckRef = useRef<number>(0);
   const lastLocationRef = useRef<LocationType | null>(null);
   const lastRouteUpdateRef = useRef<number>(0);
+  const lastPrefilledDestKeyRef = useRef<string>("");
 
   // Navigation constants - thresholds for route following
   const ARRIVAL_THRESHOLD_M = 20; // meters - when to advance to next step (maneuver reached)
@@ -151,13 +145,52 @@ export default function ExteriorNavigationScreen() {
         const newLocation: LocationType = {
           latitude: loc.coords.latitude,
           longitude: loc.coords.longitude,
-          accuracy: loc.coords.accuracy ?? undefined,
+          accuracy: loc.coords.accuracy,
         };
         setCurrentLocation(newLocation);
         lastLocationRef.current = newLocation;
       }
     })();
   }, []);
+
+  useEffect(() => {
+    const destText =
+      typeof presetDestination === "string" ? presetDestination.trim() : "";
+    if (!destText) return;
+    if (isNavigating) return;
+
+    const type = typeof presetType === "string" ? presetType : "E";
+    if (type === "I") return;
+
+    const destKey = `${type}:${destText}`;
+    if (destKey === lastPrefilledDestKeyRef.current) return;
+    lastPrefilledDestKeyRef.current = destKey;
+
+    let cancelled = false;
+    (async () => {
+      try {
+        const destResult = await geocodePlaceName(destText);
+        if (cancelled) return;
+        setDestination({
+          lat: destResult.lat,
+          lng: destResult.lng,
+          name: destResult.name,
+        });
+        setShowDestinationModal(false);
+        setToInput(destText);
+      } catch (error: any) {
+        if (cancelled) return;
+        console.error("[Exterior] Failed to prefill destination:", error);
+        Alert.alert("Error", error?.message || "Failed to resolve that destination.");
+        // Allow retry if the same dest is passed again.
+        lastPrefilledDestKeyRef.current = "";
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [presetDestination, presetType, isNavigating]);
 
   // Update ETA based on actual remaining distance along route
   useEffect(() => {
@@ -348,27 +381,20 @@ export default function ExteriorNavigationScreen() {
 
     setIsLoadingRoute(true);
     try {
+      const options: RoutingOptions = {
+        originLat: startOrigin.lat,
+        originLng: startOrigin.lng,
+        destLat: destination.lat,
+        destLng: destination.lng,
+        profile: "foot-walking",
+      };
+
       // Update origin state to reflect what we're actually using
       setOrigin(startOrigin);
 
-      // Reuse existing route if already fetched (from handleSearchRoute),
-      // otherwise fetch a new one
-      let navRoute = route;
-      if (!navRoute) {
-        const options: RoutingOptions = {
-          originLat: startOrigin.lat,
-          originLng: startOrigin.lng,
-          destLat: destination.lat,
-          destLng: destination.lng,
-          profile: "foot-walking",
-        };
-        navRoute = await fetchRoute(options);
-        setRoute(navRoute);
-        routeRef.current = navRoute;
-      } else {
-        routeRef.current = navRoute;
-      }
-
+      const newRoute = await fetchRoute(options);
+      setRoute(newRoute);
+      routeRef.current = newRoute;
       setCurrentStepIndex(0);
       currentStepIndexRef.current = 0;
       setIsNavigating(true);
@@ -380,8 +406,8 @@ export default function ExteriorNavigationScreen() {
       deviationCheckRef.current = 0;
 
       // Speak first instruction
-      if (navRoute.steps[0]) {
-        speakInstruction(navRoute.steps[0].instructionText);
+      if (newRoute.steps[0]) {
+        speakInstruction(newRoute.steps[0].instructionText);
         lastSpokenStepRef.current = 0;
       }
 
@@ -409,8 +435,8 @@ export default function ExteriorNavigationScreen() {
           const newLocation: LocationType = {
             latitude: loc.coords.latitude,
             longitude: loc.coords.longitude,
-            accuracy: loc.coords.accuracy ?? undefined,
-            heading: loc.coords.heading ?? undefined,
+            accuracy: loc.coords.accuracy,
+            heading: loc.coords.heading,
           };
           setCurrentLocation(newLocation);
 
@@ -601,7 +627,6 @@ export default function ExteriorNavigationScreen() {
     originMode,
     originCoords,
     origin,
-    route,
     speakInstruction,
     checkDeviation,
     checkMilestones,
@@ -774,7 +799,7 @@ export default function ExteriorNavigationScreen() {
         // Limit cache size (keep last 10 routes)
         if (routeCacheRef.current.size > 10) {
           const firstKey = routeCacheRef.current.keys().next().value;
-          if (firstKey) routeCacheRef.current.delete(firstKey);
+          routeCacheRef.current.delete(firstKey);
         }
       } else {
         console.log("[Exterior] Using cached route");
@@ -927,7 +952,7 @@ export default function ExteriorNavigationScreen() {
   }, []);
 
   // Handle speech recognition results for native platforms
- /* useSpeechRecognitionEvent('result', useCallback((event: any) => {
+  useSpeechRecognitionEvent('result', useCallback((event: any) => {
     if (isListeningDestination && event.results && event.results.length > 0) {
       const transcript = event.results[0]?.transcript || "";
       if (transcript.trim()) {
@@ -959,7 +984,6 @@ export default function ExteriorNavigationScreen() {
       nativeRecognitionResultRef.current = "";
     }
   }, [isListeningDestination]));
-*/
 
   // Handle voice input for destination
   const handleVoiceInput = useCallback(async () => {
@@ -973,18 +997,12 @@ export default function ExteriorNavigationScreen() {
             recognitionRef.current.stop();
           } catch {}
         }
-      } /*else { // removed for testing purpose
+      } else {
         try {
           await ExpoSpeechRecognitionModule.stop();
         } catch (error) {
           console.error("Error stopping recognition:", error);
         }
-      }*/
-      else {
-        Alert.alert(
-          "Unavailable",
-          "Speech recognition not supported in Expo Go (Android)."
-        );
       }
       setIsListeningDestination(false);
       nativeRecognitionResultRef.current = "";
@@ -1045,7 +1063,7 @@ export default function ExteriorNavigationScreen() {
       } catch (error) {
         Alert.alert("Error", "Failed to start speech recognition. Please try typing instead.");
       }
-    }/* else {
+    } else {
       // Native implementation using expo-speech-recognition
       try {
         // Request permissions
@@ -1070,14 +1088,8 @@ export default function ExteriorNavigationScreen() {
         setIsListeningDestination(false);
         const errorMsg = error?.message || "Failed to start speech recognition";
         Alert.alert("Error", `${errorMsg}. Please try typing instead.`);
-      } removed for testing purpose
-    }*/
-        else {
-          Alert.alert(
-            "Unavailable",
-            "Speech recognition is not supported in Expo Go on Android right now."
-          );
-}
+      }
+    }
   }, [isListeningDestination, handleSearchRoute]);
 
   // Format ETA
@@ -1480,14 +1492,7 @@ export default function ExteriorNavigationScreen() {
             style={[styles.controlBtn, styles.stopBtn]}
             onPress={() => {
               Haptics.impactAsync(Haptics.ImpactFeedbackStyle.Medium);
-              Alert.alert(
-                "End Navigation",
-                "Are you sure you want to end active navigation?",
-                [
-                  { text: "Cancel", style: "cancel" },
-                  { text: "End", style: "destructive", onPress: () => stopNavigation() }
-                ]
-              );
+              stopNavigation();
             }}
           >
             <MaterialIcons name="stop" size={32} color={GOLD} />
